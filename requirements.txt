@@ -1,0 +1,12 @@
+fastapi
+uvicorn
+jinja2
+python-multipart
+aiohttp
+google-genai
+google-adk
+mcp[cli]
+websockets
+numpy
+torch
+torchaudio
