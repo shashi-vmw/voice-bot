@@ -142,8 +142,12 @@ async def websocket_endpoint(websocket: WebSocket):
     server_params = StdioServerParameters(command=sys.executable, args=[MCP_SERVER_SCRIPT])
     
     # Initialize VAD Iterator for this session
-    vad_iterator = VADIterator(model) if model else None
+    # threshold=0.3 is sensitive; reset states for new connection
+    vad_iterator = VADIterator(model, threshold=0.3, sampling_rate=16000) if model else None
     
+    # Shared state for Interruption Handling
+    state = {"is_user_speaking": False}
+
     try:
         async with stdio_client(server_params) as (read, write):
             async with ClientSession(read, write) as mcp_session:
@@ -187,6 +191,11 @@ async def websocket_endpoint(websocket: WebSocket):
                             try:
                                 while True:
                                     async for response in gemini_session.receive():
+                                        # FIX: Check interrupt state BEFORE processing any response chunk
+                                        if state["is_user_speaking"]:
+                                            # Drop packet immediately
+                                            continue
+
                                         if response.server_content:
                                             model_turn = response.server_content.model_turn
                                             if model_turn:
@@ -232,11 +241,13 @@ async def websocket_endpoint(websocket: WebSocket):
                                 logger.info("Sending initial greeting...")
                                 await gemini_session.send(input="Hello. Introduce yourself.", end_of_turn=True)
                                 
-                                # FIX: Smaller buffer for VAD (must be exactly 512 samples / 1024 bytes)
-                                # But Gemini prefers larger chunks. So we keep a separate buffer for Gemini.
-                                vad_chunk_size = 512 # Samples
-                                vad_buffer = [] # Float32 samples
+                                # Buffer management
+                                vad_chunk_size = 512 # Silero strict requirement (samples)
+                                vad_buffer = [] # Float32 samples buffer for VAD
                                 
+                                # Audio Accumulation for Gemini
+                                audio_buffer = bytearray()
+
                                 while True:
                                     message = await websocket.receive_json()
                                     if message["type"] == "audio":
@@ -246,23 +257,54 @@ async def websocket_endpoint(websocket: WebSocket):
                                             # 1. Convert to Float32 Tensor for VAD
                                             tensor_audio = int2float(audio_data)
                                             
-                                            # 2. Chunking for Silero (Must be exactly 512 samples)
-                                            # Accumulate new samples
+                                            # Debugging: Check Volume (RMS)
+                                            rms = torch.sqrt(torch.mean(tensor_audio**2)).item()
+                                            if rms < 0.001: 
+                                                pass 
+
+                                            # 2. Chunking for Silero
                                             vad_buffer.extend(tensor_audio.tolist())
                                             
-                                            # Process in 512-sample blocks
                                             while len(vad_buffer) >= vad_chunk_size:
-                                                chunk = torch.tensor(vad_buffer[:vad_chunk_size])
+                                                # FIX: Extract exact 512 chunk and UNSQUEEZE to add Batch dimension (1, 512)
+                                                chunk = torch.tensor(vad_buffer[:vad_chunk_size]).unsqueeze(0)
                                                 vad_buffer = vad_buffer[vad_chunk_size:]
                                                 
-                                                if vad_iterator:
-                                                    speech_dict = vad_iterator(chunk, return_seconds=True)
-                                                    if speech_dict:
-                                                        logger.info(f"🗣️ VAD: Speech Detected {speech_dict}")
+                                                if model:
+                                                    if vad_iterator:
+                                                        speech_dict = vad_iterator(chunk[0], return_seconds=True) 
+                                                        if speech_dict:
+                                                            logger.info(f"🗣️ VAD EVENT: {speech_dict}")
+                                                            # Implement Interruption State
+                                                            if "start" in speech_dict:
+                                                                # Detect barge-in START
+                                                                if not state["is_user_speaking"]:
+                                                                    state["is_user_speaking"] = True
+                                                                    logger.info("🛑 Barge-in Detected: Muting Bot")
+                                                                    
+                                                                    # FIX: Send CLEAR SIGNAL to frontend immediately
+                                                                    await websocket.send_json({"type": "clear_audio"})
+                                                                    
+                                                                    # FIX: Explicitly tell Gemini to STOP generating by sending a user turn end signal.
+                                                                    # Sending a space or punctuation effectively closes the previous turn.
+                                                                    await gemini_session.send(input=" ", end_of_turn=True)
 
-                                            # 3. Forward original bytes to Gemini (Gemini handles buffering internally or thrives on ~4KB)
-                                            # We send data immediately to minimize latency, Gemini VAD handles the rest.
-                                            await gemini_session.send(input={"mime_type": "audio/pcm;rate=16000", "data": audio_data}, end_of_turn=False)
+                                                            if "end" in speech_dict:
+                                                                # Detect speech END
+                                                                if state["is_user_speaking"]:
+                                                                    state["is_user_speaking"] = False
+                                                                    logger.info("▶️ Speech Ended: Resuming Bot")
+
+                                            # 3. Forward original bytes to Gemini 
+                                            audio_buffer.extend(audio_data)
+                                            
+                                            # Lower buffer threshold (4096 = ~128ms) for faster response/interruption processing
+                                            if len(audio_buffer) >= 4096:
+                                                if len(audio_buffer) % 2 != 0:
+                                                    audio_buffer = audio_buffer[:-1]
+                                                
+                                                await gemini_session.send(input={"mime_type": "audio/pcm;rate=16000", "data": bytes(audio_buffer)}, end_of_turn=False)
+                                                audio_buffer.clear()
 
                                         except Exception as decode_err:
                                             logger.error(f"Audio Processing Error: {decode_err}")
